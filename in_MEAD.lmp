@@ -1,0 +1,168 @@
+# This is the initialisation of the potential with KIM.
+# You need to compile LAMMPS with the KIM package and install
+# The mode through the kim-api-collection-management script
+# See the OpenKim documentation for more info.
+kim init Sim_LAMMPS_ADP_StarikovGordeevLysogorskiy_2020_SiAuAl__SM_113843830602_000 metal
+
+atom_style      full
+boundary        p p m
+comm_style      tiled
+
+# This is your substrate surface
+read_data       data.in.lmp nocoeff
+
+kim interactions Al Al
+
+# Preparing computation to increase box height
+compute         zmax all reduce max z
+compute         Peall all pe/atom
+
+# Some ratio of atoms to keep in the python scripts.
+# You can pass the "index" style variable as arguments through the command-line.
+# See the lammps documentation.
+variable        radius_surf equal 1
+variable        ratio equal 0.001
+variable        ecutoff equal 0.15
+variable        RSeed index 10
+variable        LoopMax index 1
+variable        Temp index 300
+
+thermo 1
+reset_timestep  0
+
+# There are large amount of neighbors during the procedure so you need to
+# increase these values for neighbor lists to be built.
+neigh_modify    page 500000 one 50000 check no
+
+# This can help counting the number of new atoms at each loop.
+group       new empty
+variable    newcount equal count(new)
+print "# Step    Ntot       Nnew" file step.dat
+
+# create_atoms still needs a lattice
+# The "lat" value is the distance between each phantom atoms.
+variable        lat index 0.7
+variable        dz equal v_lat
+variable        dispx equal v_lat/2.
+variable        dispy equal v_lat/2.
+variable        dispz equal v_lat/2.
+
+min_style fire
+lattice         sc ${lat}
+
+############-------------------###########################################
+# Main loop
+
+variable        LoopNB equal 0
+label           loopdepoAtoms
+variable        mycount equal count(all)
+variable        Donkey equal ${LoopNB}
+variable        LoopNB equal "v_Donkey + 1"
+
+print "Starting loop ${LoopNB}"
+balance         1. rcb
+
+##############################---------------##############
+
+# Construct surface and write the data.
+# This script requires the ovito Python lib. You can install it through most
+# Python package manager. Check Ovito's doc fore more information.
+
+# You can have information on the meaning of each argument using -h with the
+# Python script.
+variable filename string data.in.lmp
+shell python ovito_surf.py -f ${filename} -o Mysurface -g --iso 0.3 --grid-resolution 100 --meshformat vtk --pbc xy --dz ${dz}
+
+# ##############-------------------------------#################
+
+variable        dims file Mysurface.geom
+variable        dx1 equal next(dims)
+variable        dx2 equal next(dims)
+variable        dy1 equal next(dims)
+variable        dy2 equal next(dims)
+variable        dz1 equal next(dims)
+variable        dz2 equal next(dims)
+
+# Filling the region
+region          VFM block ${dx1} ${dx1} ${dx1} ${dx1} ${dx1} ${dx1} units box
+
+create_atoms    2 region VFM
+
+region          VFM delete
+
+group           Ph type 2
+
+neigh_modify    exclude type 1 1
+neigh_modify    exclude type 2 2
+
+compute         PePh Ph pe/atom
+
+thermo          100
+thermo_style    custom step temp epair etotal press pxx pyy v_newcount
+
+# Displace atoms randomly
+variable RSeed index 10
+displace_atoms Ph random ${dispx} ${dispy} ${dispz} ${RSeed} units box
+
+dump            1 Ph custom 1 dump.peal.lammpstrj id type x y z c_PePh
+run             0
+undump          1
+
+delete_atoms    group Ph
+uncompute       PePh
+
+##########################################
+# Extract minimum energies and respective positions.
+
+# This scripts reads the dump file and extract the atoms using the criterion
+# given in the related paper. It writes a data file as an output.
+
+shell python extract_min_energy_mix.py -i dump.peal.lammpstrj -o data.min.lmp -p 0.5 -e ${ecutoff} -r 3. -f full
+
+#######################-------------------------#####################
+
+read_data       data.min.lmp add append group NEW
+group           new union new NEW
+
+#####################################################################
+# Delete Overlapping Atoms.
+# Minimization part below.
+
+neigh_modify    exclude none
+neigh_modify    delay 1 every 1 check no
+
+group           TY2 type 2
+
+# Thermalization and change of the phantom atoms type.
+neigh_modify    delay 10 every 1 check yes
+
+thermo          100
+
+fix TFMC all tfmc 0.15 ${Temp} ${RSeed} com 1 1 1 rot
+run 1000
+unfix TFMC
+
+set             group TY2 type 1
+
+group           TY2 clear
+group           NEW clear
+
+run 0
+
+# Compute zmax coordinate to see if we need to make the box bigger.
+variable        zmax equal c_zmax
+variable        d equal lz-v_zmax
+thermo_style    custom step c_zmax
+
+dump            1 all custom 1 dump.${LoopNB}.lammpstrj id type x y z c_Peall
+run 0
+undump          1
+
+if "$d < 3." then "change_box all z delta 0. 10. units box"
+
+variable        mycount equal count(all)
+print "Number of atoms ${mycount}"
+print "${LoopNB} ${mycount} ${newcount}" append step.dat
+if "${newcount} < 500000" then "jump SELF loopdepoAtoms"
+
+write_data     data.sput.lmp
