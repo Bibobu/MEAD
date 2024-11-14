@@ -70,7 +70,7 @@ balance         1. rcb
 
 # You can have information on the meaning of each argument using -h with the
 # Python script.
-variable filename string data.in.lmp
+if "${LoopNB} == 1" then "variable filename string data.in.lmp" else "variable filename string dump.${Donkey}.lammpstrj"
 shell python ovito_surf.py -f ${filename} -o Mysurface -g --iso 0.3 --grid-resolution 100 --meshformat vtk --pbc xy --dz ${dz}
 
 # ##############-------------------------------#################
