@@ -15,10 +15,17 @@ from lammps import lammps, LMP_STYLE_ATOM, LMP_TYPE_VECTOR
 
 from mead_inputs import *
 
-Kbs = {
-        'real': 0.0019872067, # kcal/mol/K
-        'metal': 8.617343e-5, # eV/K
-        }
+
+def distance(pos1, pos2, lx, ly):
+    dx = np.sqrt((pos1[0]-pos2[0])**2)
+    dx -= dx*np.rint(dx/lx)*lx
+    dy = np.sqrt((pos1[1]-pos2[1])**2)
+    dy -= dy*np.rint(dy/ly)*ly
+    dz = np.sqrt((pos1[2]-pos2[2])**2)
+    dist = np.sqrt(dx*dx+dy*dy+dz*dz)
+    return dist
+
+
 def compute_surface(lmp, radius_surf, isolevel, resolution):
     import vtk
     import ovito
@@ -75,26 +82,104 @@ def compute_surface(lmp, radius_surf, isolevel, resolution):
     if np.abs(yhi-ylo) < lat:
         yhi += lat/2.
     if np.abs(zhi-zlo) < lat:
-        zhi += lat/2.
+        zhi = zlo + lat
 
     return [xlo, xhi, ylo, yhi, zlo, zhi]
 
 
-def compute_minima(phantom_coords, phantom_energy, phantom_min, phantom_max):
+def compute_minima(lmp, rng, phantom_coords, phantom_energy, phantom_min, phantom_max, Temp):
 
-    KbT = Kbs[units]*Temp
+    # LAMMPS global parameters
+    Kb = lmp.extract_global('boltz')
+    xlo = lmp.extract_global('boxxlo')
+    xhi = lmp.extract_global('boxxhi')
+    ylo = lmp.extract_global('boxylo')
+    yhi = lmp.extract_global('boxyhi')
+    lx = xhi-xlo
+    ly = yhi-ylo
+
+    # MC or regular MEAD
+    KbT = Kb*Temp
     thresh = 0.15
-    n = 1
+    rc = 3.15
     keep = []
-    for p in range(phantom_min, phantom_max):
-        energy = phantom_energy[p]
-        minen = np.min(energy)
-        for i, at in enumerate(phantom_coords):
-            # print(p, energy[i], minen, np.abs((energy[i]-minen))/minen)
-            if np.abs((energy[i] - minen)/minen) < thresh:
-                keep.append([p, at[0], at[1], at[2]])
+    nphantoms = phantom_coords.shape[0]
+    nadatoms = 100
+    nstep = 10
+    if nphantoms < nadatoms:
+        logging.warning("Number of deposited atoms {:d} higher than phantom positions {:d}. Switching to old MEAD.".format(nphantoms,nadatoms))
+        KbT = 0
 
-    # print("I've seen {:d} atoms.".format(i))
+    # print("KBT = {:f}, Kb = {:f}, T = {:f}".format(KbT, Kb, Temp))
+    if KbT:
+        print("Using MC moves")
+        actual_atoms = np.zeros(nphantoms, dtype=int)
+        rand_init_ids = rng.choice(nphantoms, size=nadatoms, replace=False)
+        for n, i in enumerate(rand_init_ids):
+            actual_atoms[i] = n+1
+
+        for myatom in range(n):
+            print("Added {:d} atoms".format(myatom))
+            myatom_id = np.argwhere(actual_atoms == myatom+1)[0]
+            myatom_pos = phantom_coords[myatom_id]
+            myatom_pos = np.reshape(myatom_pos, 3)
+
+            # Testing to see if atom typs is switched
+            test_ratio = rng.uniform()
+            switch = 0
+            for i, n in enumerate(ratio):
+                if test_ratio > np.sum(ratio[:i]):
+                    switch = i
+            myatom_type = phantom_min + switch
+            energy = phantom_energy[myatom_type]
+            myatom_energy = energy[myatom_id]
+
+            # MC moves
+            for step in range(nstep):
+                rand_atom_id = rng.choice(nphantoms, size=1)[0]
+                if (actual_atoms[rand_atom_id] != 0):
+                    continue
+
+                rand_atom_pos = phantom_coords[rand_atom_id]
+                rand_atom_pos = np.reshape(rand_atom_pos, 3)
+                too_close = False
+                for o, other in enumerate(actual_atoms):
+                    if other == myatom_id or other == rand_atom_id:
+                        continue
+                    if other != 0:
+                        check_pos = phantom_coords[o]
+                        check_pos = np.reshape(check_pos, 3)
+                        if (distance(check_pos, rand_atom_pos, lx, ly) < rc):
+                            too_close = True
+                            break
+                if too_close:
+                    continue
+
+                # MC check
+                rand_atom_energy = energy[rand_atom_id]
+                delta_E = myatom_energy - rand_atom_energy
+                proba = np.exp(delta_E/KbT)
+                # print(proba, myatom_energy, rand_atom_energy)
+                if (proba > 1.) or (rng.uniform() < proba):
+                    actual_atoms[myatom_id] = 0
+                    myatom_id = rand_atom_id
+                    myatom_pos = np.reshape(rand_atom_pos, 3)
+                    myatom_energy = rand_atom_energy
+                    actual_atoms[myatom_id] = n+1
+            actual_atoms[myatom_id] = -1
+            myatom_pos = np.reshape(myatom_pos, 3)
+            keep.append([myatom_type, myatom_pos[0], myatom_pos[1], myatom_pos[2]])
+    # Regular MEAD
+    else:
+        print("Using old MEAD")
+        actual_atoms = np.zeros(nphantoms)
+        for p in range(phantom_min, phantom_max):
+            energy = phantom_energy[p]
+            minen = np.min(energy)
+            for i, at in enumerate(phantom_coords):
+                # print(p, energy[i], minen, np.abs((energy[i]-minen))/minen)
+                if np.abs((energy[i] - minen)/minen) < thresh:
+                    keep.append([p, at[0], at[1], at[2]])
 
     with open('data.min.lmp', 'w') as f:
         f.write("Minimum energy position from MEAD output\n")
@@ -120,7 +205,7 @@ def compute_minima(phantom_coords, phantom_energy, phantom_min, phantom_max):
 def create_system(lmp, nattype):
     # An example of system creation
     # lmp.command('lattice diamond 5.43  orient z 1 1 1 orient x 1 -1 0 orient y 1 1 -2 origin 0.01 0.01 0.01')
-    lmp.command('lattice {:s} {:f} origin 0.01 0.01 0.01'.format(mead_lattice_create, mead_spacing_create))
+    lmp.command('lattice {:s} {:f} origin 0.01 0.01 0.01'.format(mead_lattice_create, mead_lattice_spacing))
     lmp.command('region mybox block 0 10 0 10 0 10')
     lmp.command('create_box {:d} mybox'.format(nattype))
     lmp.command('region mysurf block 0 10 0 10 0 5')
@@ -131,7 +216,7 @@ def create_system(lmp, nattype):
         lmp.command('mass {:d} {:f}'.format(i+1, atmasses[i]))
 
     lmp.command('displace_atoms all move 0 0 0.5')
-    lmp.command('write_data {:s}'.format(mead_data_create))
+    lmp.command('write_data {:s}'.format('data.in.lmp'))
 
     return
 
@@ -178,6 +263,15 @@ def main():
         action='store_true',
         help="Writes dump files containing phantom atoms positions and energy."
     )
+    # Temperature is in the mead_inputs.py file
+    # parser.add_argument(
+    #     "-t",
+    #     "--temp",
+    #     dest="temp",
+    #     type=float,
+    #     default=0.,
+    #     help="Temperature for MC if any (default 0K = No MC)",
+    # )
 
 
     args = parser.parse_args()
@@ -217,7 +311,7 @@ def main():
     if args.data:
         if me == 0:
             logging.info("Reading data file {:s}".format(args.data))
-        lmp.command('read_data {:s}'.format(args.data))
+        lmp.command('read_data {:s} nocoeff'.format(args.data))
     else:
         if me == 0:
             logging.info("Creating new surface from mead_create.py")
@@ -231,7 +325,7 @@ def main():
 
     # This is where the main MEAD parameters are read
     lmp.command('variable        radius_surf equal {:f}'.format(radius_surf))
-    lmp.command('variable        ratio equal {:f}'.format(ratio))
+    # lmp.command('variable        ratio equal {:f}'.format(ratio))
     lmp.command('variable        ecutoff index {:f}'.format(ecutoff))
     lmp.command('variable        RSeed equal {:d}'.format(rseed))
     lmp.command('variable        LoopMax index {:d}'.format(LoopMax))
@@ -253,8 +347,10 @@ def main():
     lmp.command('lattice         sc ${lat}')
 
     phantom_energy = {}
-    phantom_min = 4
-    phantom_max = 5
+    phantom_min = isghost.index(True) + 1
+    phantom_max = len(isghost)
+    if me == 0:
+        print("Phantom min/max = {:d} {:d}".format(phantom_min, phantom_max))
     nloop = 0
 
     while True:
@@ -312,6 +408,8 @@ def main():
 
         phantom_ids = atom_ids[atom_types == phantom_min]
         phantom_coords = atom_coords[atom_types == phantom_min][:]
+        if me == 0:
+            print("Retrieved {:d} atoms out of {:d}".format(phantom_coords.shape[0], atom_coords.shape[0]))
 
         for i in range(phantom_min, phantom_max+1):
             lmp.command('neigh_modify    exclude type {:d} {:d}'.format(i, i))
@@ -341,7 +439,7 @@ def main():
             phantom_energy[p] = energy[atom_types >= phantom_min]
 
         if me == 0:
-            compute_minima(phantom_coords, phantom_energy, phantom_min, phantom_max)
+            compute_minima(lmp, rng, phantom_coords, phantom_energy, phantom_min, phantom_max, Temp)
 
         lmp.command('delete_atoms    group Ph')
         lmp.command('uncompute       PePh')
@@ -353,13 +451,14 @@ def main():
         # (safer than manipulating the data in LAMMPS since it uses pointers)
         lmp.command('read_data       data.min.lmp add append group NEW')
         lmp.command('delete_atoms    overlap 1. NEW NEW')
+        lmp.command('reset_atoms id sort yes')
 
         lmp.command('group           new union new NEW')
 
         lmp.command('neigh_modify    exclude none')
         lmp.command('neigh_modify    delay 1 every 1 check no')
 
-        for p in range(phantom_min, phantom_max):
+        for p in range(phantom_min, phantom_max+1):
             lmp.command('group TY{:d} type {:d}'.format(p, p))
             newtype = phantom_to_real[p-1]
             lmp.command('set             group TY{:d} type {:d}'.format(p, newtype))
@@ -385,6 +484,7 @@ def main():
         lmp.command('thermo_style    custom step c_zmax')
 
         lmp.command('dump            1 all custom 1 dump.end.lammpstrj.{:d} id type x y z c_Peall'.format(nloop))
+        lmp.command('dump_modify 1 sort id')
         lmp.command('run             0')
         lmp.command('undump          1')
 
