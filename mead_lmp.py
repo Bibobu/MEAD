@@ -15,7 +15,6 @@ from lammps import lammps, LMP_STYLE_ATOM, LMP_TYPE_VECTOR
 
 from mead_inputs import *
 
-
 def distance(pos1, pos2, lx, ly):
     dx = np.sqrt((pos1[0]-pos2[0])**2)
     dx -= dx*np.rint(dx/lx)*lx
@@ -55,6 +54,7 @@ def compute_surface(lmp, radius_surf, isolevel, resolution):
     data.apply(SURFmod)
     data.apply(SLICmod)
     surface = data.surfaces["surface_"]
+    surface.make_mutable(surface.vertices)
     surface.domain_.pbc = (pbc[0], pbc[1], 0)
 
     outfile = "".join(["surface", ".vtk"])
@@ -69,7 +69,7 @@ def compute_surface(lmp, radius_surf, isolevel, resolution):
     writer.SetFileName("".join(["surface", ".stl"]))
     writer.Write()
 
-    positions = surface.vertices_['Position']
+    positions = surface.vertices['Position']
 
     # Ugly but similar to original version
     positions = positions[positions[:, 2] > slice_dist]
@@ -263,7 +263,6 @@ def main():
         action='store_true',
         help="Writes dump files containing phantom atoms positions and energy."
     )
-    # Temperature is in the mead_inputs.py file
     # parser.add_argument(
     #     "-t",
     #     "--temp",
@@ -279,6 +278,7 @@ def main():
 
     rng = np.random.default_rng()
     rseed = args.rseed if args.rseed else rng.integers(1000000)
+    relax_flag = False
 
     comm = MPI.COMM_WORLD
     me = comm.Get_rank()
@@ -316,8 +316,16 @@ def main():
         if me == 0:
             logging.info("Creating new surface from mead_create.py")
         create_system(lmp, nattype)
+        relax_flag = True
 
     lmp.command(' '.join(['kim', 'interactions']+atnames))
+
+    if relax_flag:
+        lmp.command('fix BOX all box/relax x 0 y 0 fixedpoint 0. 0. 0.')
+        lmp.command('minimize 1e-8 1e-10 10000 10000')
+        lmp.command('unfix BOX')
+        lmp.command('reset_timestep 0')
+
 
     # Preparing computation to increase box height
     lmp.command('compute         zmax all reduce max z')
@@ -508,3 +516,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         raise SystemExit("User interruption.")
+
